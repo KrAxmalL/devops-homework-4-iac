@@ -1,0 +1,10 @@
+master_address: ${pssql_master_address}
+replica_address: ${pssql_replica_address}
+replication_user: replication_user
+replication_password: password
+db_name: school
+logical_db_name: school_logical
+subject_table_name: subject
+teacher_table_name: teacher
+publication_name: teacher_publication
+subscription_name: teacher_subscription

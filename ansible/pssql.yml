@@ -1,0 +1,227 @@
+---
+- name: Install PostgreSQL
+  hosts: all
+  become: true
+  remote_user: ubuntu
+
+  tasks:
+    - name: "Update apt packages"
+      become: true
+      apt:
+        update_cache: yes
+
+    - name: "Install packages required for PostgreSQL modules"
+      apt:
+        name:
+          - acl
+          - libpq-dev
+          - build-essential
+          - python3-psycopg2
+        state: present
+
+    - name: "Install PostgreSQL"
+      apt:
+        name: postgresql-16
+        state: present
+
+    - name: "Start PostgreSQL"
+      service:
+        name: postgresql
+        enabled: yes
+        state: started
+
+- name: Configure PostgreSQL Master Server
+  hosts: master
+  become: true
+  remote_user: ubuntu
+  vars_files:
+    - ./vars/main.yml
+  handlers:
+    - name: Restarts
+      import_tasks: ./handlers/main.yml
+
+  tasks:
+    - name: "Create 'school' database"
+      become: yes
+      become_user: postgres
+      postgresql_db:
+        state: present
+        name: "{{ db_name }}"
+
+    - name: "Create 'subject' table"
+      become: yes
+      become_user: postgres
+      postgresql_table:
+        db: "{{ db_name }}"
+        table: "{{ subject_table_name }}"
+        columns:
+          - id SERIAL PRIMARY KEY
+          - title VARCHAR(100) NOT NULL
+
+    - name: "Insert data into 'subject' table"
+      become: yes
+      become_user: postgres
+      postgresql_query:
+        db: "{{ db_name }}"
+        query: INSERT INTO subject(title) VALUES ('Physics'), ('Math'), ('Chemistry')
+
+    - name: "Create 'teacher' table"
+      become: yes
+      become_user: postgres
+      postgresql_table:
+        db: "{{ db_name }}"
+        table: "{{ teacher_table_name }}"
+        columns:
+          - id SERIAL PRIMARY KEY
+          - first_name VARCHAR(100) NOT NULL
+          - last_name VARCHAR(100) NOT NULL
+
+    - name: "Insert data into 'teacher' table"
+      become: yes
+      become_user: postgres
+      postgresql_query:
+        db: "{{ db_name }}"
+        query: INSERT INTO teacher(first_name, last_name) VALUES ('John', 'Doe'), ('Bob', 'Deryck')
+
+    - name: "Create 'replication_user' with replication permissions"
+      become: yes
+      become_user: postgres
+      postgresql_user:
+        state: present
+        name: "{{ replication_user }}"
+        password: "{{ replication_password }}"
+        role_attr_flags: REPLICATION,LOGIN
+
+    - name: "Grant permissions to 'replication_user' for logical replication"
+      become: yes
+      become_user: postgres
+      postgresql_privs:
+        type: table
+        objs: "{{ teacher_table_name }}"
+        database: "{{ db_name }}"
+        roles: "{{ replication_user }}"
+        grant_option: yes
+        privs: SELECT
+
+    - name: "Create 'teacher_publication'"
+      become: yes
+      become_user: postgres
+      postgresql_publication:
+        db: "{{ db_name }}"
+        name: "{{ publication_name }}"
+        tables:
+          - "{{ teacher_table_name }}"
+
+    - name: "Allow 'school' database connection for 'replication_user'"
+      become: yes
+      become_user: postgres
+      postgresql_pg_hba:
+        dest: "/etc/postgresql/16/main/pg_hba.conf"
+        contype: host
+        databases: "{{ db_name }}"
+        method: md5
+        users: "{{ replication_user }}"
+        address: "{{ replica_address }}/32"
+        create: true
+
+    - name: "Allow replication connection for 'replication_user'"
+      become: yes
+      become_user: postgres
+      postgresql_pg_hba:
+        dest: "/etc/postgresql/16/main/pg_hba.conf"
+        contype: host
+        databases: replication
+        method: md5
+        users: "{{ replication_user }}"
+        address: "{{ replica_address }}/32"
+        create: true
+
+    - name: "Enable listening on all addresses"
+      become: yes
+      become_user: postgres
+      postgresql_set:
+        name: listen_addresses
+        value: '*'
+
+    - name: "Set 'wal_level' to allow logical replication"
+      become: yes
+      become_user: postgres
+      postgresql_set:
+        name: wal_level
+        value: logical
+      notify: Restart PostgreSQL
+
+- name: Configure PostgreSQL Replica Server
+  hosts: replicas
+  become: true
+  remote_user: ubuntu
+  vars_files:
+    - ./vars/main.yml
+  handlers:
+    - name: Restarts
+      import_tasks: ./handlers/main.yml
+
+  tasks:
+    - name: "Enable listening on all addresses"
+      become: yes
+      become_user: postgres
+      postgresql_set:
+        name: listen_addresses
+        value: '*'
+
+    - name: "Cleanup the data to allow replication"
+      become: yes
+      become_user: postgres
+      shell: "rm -r /var/lib/postgresql/16/main/*"
+
+    - name : "Start the replication"
+      become: yes
+      become_user: postgres
+      environment:
+        PGPASSWORD: "{{ replication_password }}"
+      shell: "pg_basebackup --host={{ master_address }} --port=5432 --username={{ replication_user }} --pgdata=/var/lib/postgresql/16/main/ --write-recovery-conf"
+      notify: Restart PostgreSQL
+
+    - name: "Create second cluster for logical replication"
+      become: yes
+      become_user: postgres
+      shell: "pg_createcluster 16 logical"
+
+    - name: "Start the second cluster"
+      service:
+        name: postgresql@16-logical
+        state: started
+
+    - name: "Create 'school_logical' database"
+      become: yes
+      become_user: postgres
+      postgresql_db:
+        port: 5433
+        name: "{{ logical_db_name }}"
+
+    - name: "Create 'teacher' table"
+      become: yes
+      become_user: postgres
+      postgresql_table:
+        port: 5433
+        db: "{{ logical_db_name }}"
+        table: "{{ teacher_table_name }}"
+        columns:
+          - id SERIAL PRIMARY KEY
+          - first_name VARCHAR(100) NOT NULL
+          - last_name VARCHAR(100) NOT NULL
+
+    - name: "Create subscription for publication 'teacher_publication' and start logical replication"
+      become: yes
+      become_user: postgres
+      postgresql_subscription:
+        port: 5433
+        db: "{{ logical_db_name }}"
+        name: "{{ subscription_name }}"
+        publications: "{{ publication_name }}"
+        connparams:
+          host: "{{ master_address }}"
+          port: 5432
+          user: "{{ replication_user }}"
+          password: "{{ replication_password }}"
+          dbname: "{{ db_name }}"
